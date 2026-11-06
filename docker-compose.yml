@@ -16,33 +16,34 @@
       - lifemap-net
 
   spark-master:
-    image: bitnami/spark:3.5
+    image: apache/spark:3.5.1
     container_name: lifemap_spark_master
     environment:
       - SPARK_MODE=master
       - SPARK_RPC_AUTHENTICATION_ENABLED=no
       - SPARK_RPC_ENCRYPTION_ENABLED=no
-      - SPARK_SUBMIT_OPTS=-Dspark.jars.packages=org.mongodb.spark:mongo-spark-connector_2.12:10.3.0
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master", "--ip", "spark-master", "--port", "7077", "--webui-port", "8080"]
     ports:
       - "8081:8080"
       - "7077:7077"
     volumes:
-      - .:/workspace
+      - .:/opt/spark/work-dir
     networks:
       - lifemap-net
 
   spark-worker:
-    image: bitnami/spark:3.5
+    image: apache/spark:3.5.1
     container_name: lifemap_spark_worker
     environment:
       - SPARK_MODE=worker
       - SPARK_MASTER_URL=spark://spark-master:7077
       - SPARK_WORKER_MEMORY=2G
       - SPARK_WORKER_CORES=2
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077", "--webui-port", "8081"]
     depends_on:
       - spark-master
     volumes:
-      - .:/workspace
+      - .:/opt/spark/work-dir
     networks:
       - lifemap-net
 
