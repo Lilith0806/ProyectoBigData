@@ -1,0 +1,17 @@
+{
+    "train_samples": 48131,
+    "test_samples": 11869,
+    "metrics": {
+        "logistic_regression": {
+            "f1": 0.8988,
+            "precision": 0.8989,
+            "recall": 0.8987
+        },
+        "naive_bayes": {
+            "f1": 0.8765,
+            "precision": 0.8767,
+            "recall": 0.8766
+        }
+    },
+    "best_model": "LogisticRegression"
+}

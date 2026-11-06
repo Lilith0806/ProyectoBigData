@@ -28,7 +28,7 @@ services:
       retries: 5
 
   spark-master:
-    image: bitnami/spark:3.5.0
+    image: bitnami/spark:3.5
     container_name: lifemap_spark_master
     environment:
       - SPARK_MODE=master
@@ -45,7 +45,7 @@ services:
       - lifemap-net
 
   spark-worker:
-    image: bitnami/spark:3.5.0
+    image: bitnami/spark:3.5
     container_name: lifemap_spark_worker
     environment:
       - SPARK_MODE=worker

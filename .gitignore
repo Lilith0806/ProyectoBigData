@@ -1,6 +1,22 @@
-﻿data/
-results/
-.venv/
+﻿# Entornos virtuales y Python
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
 .pytest_cache/
+
+# Datos crudos pesados de Yelp (Kaggle)
+data/
+*.zip
+*.json
+!models/sentiment_summary.json
+
+# Credenciales y variables
+.env
+.kaggle/
+.kaggle_creds/
+kaggle.json
+access_token
+
+# Logs y contenedores
+*.log
+mongo_data/
