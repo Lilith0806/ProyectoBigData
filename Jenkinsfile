@@ -2,46 +2,51 @@
     agent any
 
     environment {
-        // La credencial de Kaggle se inyecta desde Jenkins Credentials (Secret file o Username/Password)
-        KAGGLE_CONFIG_DIR = "${WORKSPACE}/.kaggle_creds"
+        KAGGLE_CREDS = credentials('kaggle-credentials')
+        PYTHONPATH = "${WORKSPACE}"
     }
 
     stages {
-        stage('Checkout') {
+        stage('Checkout & Lint') {
             steps {
-                checkout scm
+                echo "Verificando integridad del repositorio y commit desplegado..."
+                sh 'git rev-parse --short HEAD'
             }
         }
 
-        stage('Descarga de Datos (Kaggle API)') {
+        stage('Pruebas Automatizadas (Pytest)') {
             steps {
-                // Inyecta el kaggle.json sin exponerlo en el repositorio
-                withCredentials([file(credentialsId: 'kaggle-json-secret', variable: 'KAGGLE_JSON_FILE')]) {
-                    sh '''
-                        mkdir -p .kaggle_creds
-                        cp "$KAGGLE_JSON_FILE" .kaggle_creds/kaggle.json
-                        chmod 600 .kaggle_creds/kaggle.json
-                        python3 -m pip install kaggle
-                        python3 src/ingestion/download_data.py
-                    '''
-                }
-            }
-        }
-
-        stage('Build & Tests') {
-            steps {
+                echo "Ejecutando pruebas unitarias, de integracion y formula de cierre..."
                 sh '''
-                    pytest tests/
+                    python3 -m pip install --upgrade pip
+                    python3 -m pip install -r requirements-api.txt pytest
+                    python3 -m pytest -v tests/
                 '''
             }
         }
 
-        stage('Deploy') {
+        stage('Construccion y Despliegue Docker') {
             steps {
-                sh '''
-                    docker compose up -d --build
-                '''
+                echo "Construyendo contenedores e iniciando servicios..."
+                sh 'docker compose up -d --build api'
             }
+        }
+
+        stage('Smoke Test API') {
+            steps {
+                echo "Validando disponibilidad de endpoints desplegados..."
+                sleep 5
+                sh 'curl -f http://api:5000/health || curl -f http://localhost:5000/health'
+            }
+        }
+    }
+
+    post {
+        failure {
+            echo "El pipeline ha fallado en las pruebas. Despliegue abortado para proteger produccion."
+        }
+        success {
+            echo "Pipeline exitoso: Servicios desplegados y verificados."
         }
     }
 }

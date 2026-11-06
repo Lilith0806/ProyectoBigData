@@ -1,31 +1,19 @@
-﻿version: '3.8'
-
-networks:
-  lifemap-net:
-    driver: bridge
-
-volumes:
-  mongo_data:
-  jenkins_home:
-
-services:
+﻿services:
   mongodb:
     image: mongo:6.0
     container_name: lifemap_mongodb
     restart: always
-    environment:
-      MONGO_INITDB_DATABASE: lifemap_db
     ports:
       - "27017:27017"
     volumes:
       - mongo_data:/data/db
-    networks:
-      - lifemap-net
     healthcheck:
       test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
       interval: 10s
       timeout: 5s
       retries: 5
+    networks:
+      - lifemap-net
 
   spark-master:
     image: bitnami/spark:3.5
@@ -34,10 +22,9 @@ services:
       - SPARK_MODE=master
       - SPARK_RPC_AUTHENTICATION_ENABLED=no
       - SPARK_RPC_ENCRYPTION_ENABLED=no
-      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
-      - SPARK_SSL_ENABLED=no
+      - SPARK_SUBMIT_OPTS=-Dspark.jars.packages=org.mongodb.spark:mongo-spark-connector_2.12:10.3.0
     ports:
-      - "8080:8080"
+      - "8081:8080"
       - "7077:7077"
     volumes:
       - .:/workspace
@@ -60,34 +47,37 @@ services:
       - lifemap-net
 
   dask-scheduler:
-    image: ghcr.io/dask/dask:latest
+    image: ghcr.io/dask/dask:2024.5.1-py3.11
     container_name: lifemap_dask_scheduler
-    command: ["dask-scheduler"]
+    command: ["dask", "scheduler"]
     ports:
       - "8786:8786"
       - "8787:8787"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import socket; s = socket.create_connection((\"127.0.0.1\", 8786), 2); s.close()'"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
     networks:
       - lifemap-net
 
   dask-worker-1:
-    image: ghcr.io/dask/dask:latest
+    image: ghcr.io/dask/dask:2024.5.1-py3.11
     container_name: lifemap_dask_worker_1
-    command: ["dask-worker", "dask-scheduler:8786", "--nthreads", "2", "--memory-limit", "2GB"]
+    command: ["dask", "worker", "tcp://dask-scheduler:8786", "--nthreads", "2", "--memory-limit", "2GB"]
     depends_on:
-      - dask-scheduler
-    volumes:
-      - .:/workspace
+      dask-scheduler:
+        condition: service_healthy
     networks:
       - lifemap-net
 
   dask-worker-2:
-    image: ghcr.io/dask/dask:latest
+    image: ghcr.io/dask/dask:2024.5.1-py3.11
     container_name: lifemap_dask_worker_2
-    command: ["dask-worker", "dask-scheduler:8786", "--nthreads", "2", "--memory-limit", "2GB"]
+    command: ["dask", "worker", "tcp://dask-scheduler:8786", "--nthreads", "2", "--memory-limit", "2GB"]
     depends_on:
-      - dask-scheduler
-    volumes:
-      - .:/workspace
+      dask-scheduler:
+        condition: service_healthy
     networks:
       - lifemap-net
 
@@ -99,16 +89,17 @@ services:
     restart: always
     environment:
       - MONGO_URI=mongodb://mongodb:27017/lifemap_db
-      - SPARK_MASTER=spark://spark-master:7077
-      - DASK_SCHEDULER=tcp://dask-scheduler:8786
       - PORT=5000
     ports:
       - "5000:5000"
-    volumes:
-      - .:/app
     depends_on:
       mongodb:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
     networks:
       - lifemap-net
 
@@ -116,11 +107,20 @@ services:
     image: jenkins/jenkins:lts-jdk17
     container_name: lifemap_jenkins
     user: root
+    restart: always
     ports:
-      - "8085:8080"
+      - "8080:8080"
       - "50000:50000"
     volumes:
       - jenkins_home:/var/jenkins_home
       - /var/run/docker.sock:/var/run/docker.sock
     networks:
       - lifemap-net
+
+networks:
+  lifemap-net:
+    driver: bridge
+
+volumes:
+  mongo_data:
+  jenkins_home:
