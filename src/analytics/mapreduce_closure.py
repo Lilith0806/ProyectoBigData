@@ -1,13 +1,11 @@
 ﻿import os
 import sys
-import time
 import json
 import numpy as np
 import pandas as pd
 import pygeohash as pgh
 import pymongo
 
-# 1. Asegurar ruta absoluta al interprete de Python para evitar el alias de Windows Store
 os.environ["PYSPARK_PYTHON"] = sys.executable
 os.environ["PYSPARK_DRIVER_PYTHON"] = sys.executable
 os.environ["SPARK_LOCAL_IP"] = "127.0.0.1"
@@ -25,139 +23,90 @@ def get_primary_category(cat_str):
             return t
     return cats[0]
 
-def run_mapreduce_closure():
+def run_analytics_delta():
     spark = SparkSession.builder \
-        .appName("LifeMap-MapReduce-Closure") \
+        .appName("LifeMap-Delta-Analytics") \
         .master("local[2]") \
         .config("spark.driver.memory", "4g") \
-        .config("spark.network.timeout", "600s") \
-        .config("spark.executor.heartbeatInterval", "60s") \
-        .config("spark.python.worker.reuse", "true") \
         .getOrCreate()
     spark.sparkContext.setLogLevel("ERROR")
 
     client = pymongo.MongoClient("mongodb://127.0.0.1:27017/")
     db = client["lifemap_db"]
 
-    print("Cargando negocios desde MongoDB...")
+    print("Extrayendo negocios y enriqueciendo con geohash...")
     cursor = db.businesses.find({}, {"business_id": 1, "categories": 1, "location": 1, "dias_negocio": 1, "cerro": 1, "_id": 0})
     raw_b = list(cursor)
     
     processed = []
+    b_geo_map = {}
     for b in raw_b:
         coords = b.get("location", {}).get("coordinates", [-75.1652, 39.9526])
-        lon, lat = coords[0], coords[1]
-        geohash_cell = pgh.encode(lat, lon, precision=6)
+        lat, lon = coords[1], coords[0]
+        gh = pgh.encode(lat, lon, precision=6)
         cat = get_primary_category(b.get("categories", ""))
         dias = max(int(b.get("dias_negocio", 1)), 1)
         cerro = int(b.get("cerro", 0))
-        processed.append({
-            "business_id": b["business_id"],
-            "category": cat,
-            "geohash": geohash_cell,
-            "dias_negocio": dias,
-            "cerro": cerro
+        bid = b["business_id"]
+        b_geo_map[bid] = gh
+        processed.append({"business_id": bid, "category": cat, "geohash": gh, "dias_negocio": dias, "cerro": cerro})
+
+    df_b = spark.createDataFrame(processed).cache()
+
+    # 1. MapReduce Cierres por Geohash
+    rdd_geo = df_b.rdd.map(lambda r: (r["geohash"], (r["cerro"], r["dias_negocio"]))) \
+                      .reduceByKey(lambda a, b: (a[0] + b[0], a[1] + b[1]))
+    geo_rates = rdd_geo.mapValues(lambda v: {
+        "cierres": v[0],
+        "dias_negocio": v[1],
+        "tasa_anualizada": round((v[0] / v[1]) * 365, 4) if v[1] >= 180 else 0.0
+    }).collectAsMap()
+
+    # 2. Porcentaje de reseñas negativas por celda Geohash
+    print("Calculando distribucion de resenas negativas por geohash...")
+    rev_cursor = db.reviews.find({"stars": {"$exists": True}}, {"business_id": 1, "stars": 1, "_id": 0}).limit(100000)
+    rev_list = []
+    for r in rev_cursor:
+        bid = r.get("business_id")
+        if bid in b_geo_map:
+            rev_list.append({"geohash": b_geo_map[bid], "es_negativa": 1 if r["stars"] <= 2.0 else 0})
+
+    df_rev = spark.createDataFrame(rev_list)
+    neg_by_geo = df_rev.groupBy("geohash").agg(
+        F.count("es_negativa").alias("total_reviews"),
+        F.sum("es_negativa").alias("total_negativas")
+    ).withColumn("pct_negativas", F.round((F.col("total_negativas") / F.col("total_reviews")) * 100, 2)).toPandas()
+
+    neg_dict = neg_by_geo.set_index("geohash").to_dict(orient="index")
+
+    # Actualizar MongoDB con porcentaje de negativas
+    geo_docs = []
+    for gh, data in geo_rates.items():
+        rev_info = neg_dict.get(gh, {"pct_negativas": 0.0, "total_reviews": 0})
+        geo_docs.append({
+            "geohash": gh,
+            **data,
+            "pct_resenas_negativas": rev_info["pct_negativas"]
         })
-
-    pdf_base = pd.DataFrame(processed)
-    df_spark = spark.createDataFrame(pdf_base)
-    
-    # Cachear el DataFrame para optimizar las operaciones
-    df_spark = df_spark.cache()
-    rdd_base = df_spark.rdd
-
-    # ============================================================
-    # 1. MAPREDUCE CON RDD: EMITIR (clave, (cerro, dias)) -> reduceByKey
-    # ============================================================
-    print("\n--- Ejecutando MapReduce con RDD: Tasas por Categoria ---")
-    rdd_cat = rdd_base.map(lambda r: (r["category"], (r["cerro"], r["dias_negocio"]))) \
-                      .reduceByKey(lambda a, b: (a[0] + b[0], a[1] + b[1]))
-
-    cat_rates_rdd = rdd_cat.mapValues(lambda v: {
-        "cierres": v[0],
-        "dias_negocio": v[1],
-        "tasa_anualizada": round((v[0] / v[1]) * 365, 4) if v[1] >= 180 else 0.0
-    }).collectAsMap()
-
-    # Validacion contra DataFrames groupBy
-    df_cat_val = df_spark.groupBy("category").agg(
-        F.sum("cerro").alias("sum_cerro"),
-        F.sum("dias_negocio").alias("sum_dias")
-    ).withColumn("tasa_df", F.round((F.col("sum_cerro") / F.col("sum_dias")) * 365, 4)).toPandas()
-
-    print("Validacion RDD reduceByKey vs DataFrame groupBy:")
-    for _, row in df_cat_val.head(5).iterrows():
-        cat = row["category"]
-        rdd_tasa = cat_rates_rdd[cat]["tasa_anualizada"]
-        df_tasa = row["tasa_df"]
-        print(f" - [{cat}] RDD: {rdd_tasa} | DF: {df_tasa} | Coinciden: {abs(rdd_tasa - df_tasa) < 1e-4}")
-
-    # MapReduce por Geohash
-    print("\n--- Ejecutando MapReduce con RDD: Tasas por Geohash ---")
-    rdd_geo = rdd_base.map(lambda r: (r["geohash"], (r["cerro"], r["dias_negocio"]))) \
-                      .reduceByKey(lambda a, b: (a[0] + b[0], a[1] + b[1]))
-    geo_rates_rdd = rdd_geo.mapValues(lambda v: {
-        "cierres": v[0],
-        "dias_negocio": v[1],
-        "tasa_anualizada": round((v[0] / v[1]) * 365, 4) if v[1] >= 180 else 0.0
-    }).collectAsMap()
-
-    # Cargar agregaciones en MongoDB
-    db.stats_category.drop()
-    cat_docs = [{"category": k, **v} for k, v in cat_rates_rdd.items()]
-    db.stats_category.insert_many(cat_docs)
-    db.stats_category.create_index("category", unique=True)
 
     db.stats_geohash.drop()
-    geo_docs = [{"geohash": k, **v} for k, v in geo_rates_rdd.items()]
     db.stats_geohash.insert_many(geo_docs)
-    db.stats_geohash.create_index("geohash", unique=True)
-    print(f"Guardadas colecciones stats_category ({len(cat_docs)}) y stats_geohash ({len(geo_docs)}).")
+    print(f"Coleccion stats_geohash actualizada con tasas y % negativas ({len(geo_docs)} docs).")
 
-    # ============================================================
-    # 2. EXPERIMENTO DE BALANCEO DE CARGA Y SESGO (CRITERIO E1.8)
-    # ============================================================
-    print("\n================ EXPERIMENTO DE BALANCEO DE CARGA ================")
-    partition_configs = [2, 8, 32, 200]
-    bench_results = []
+    # 3. Comparacion de Sesgo: Reparto Con Clave vs Sin Clave (E1.8)
+    print("\nEvaluando sesgo de reparto: Con Clave (por categoria) vs Sin Clave (8 particiones)...")
+    sin_clave = df_b.repartition(8).withColumn("pid", F.spark_partition_id()).groupBy("pid").count().toPandas()
+    con_clave = df_b.repartition(8, "category").withColumn("pid", F.spark_partition_id()).groupBy("pid").count().toPandas()
 
-    for parts in partition_configs:
-        repartitioned = df_spark.repartition(parts)
-        times = []
-        for rep in range(3):
-            t0 = time.time()
-            repartitioned.groupBy("category").agg(
-                F.sum("cerro"),
-                F.sum("dias_negocio")
-            ).collect()
-            times.append(time.time() - t0)
-        
-        counts_df = repartitioned.withColumn("pid", F.spark_partition_id()) \
-                                 .groupBy("pid").count().toPandas()
-        
-        mean_time = float(np.mean(times))
-        std_time = float(np.std(times))
-        min_rows = int(counts_df["count"].min())
-        max_rows = int(counts_df["count"].max())
-        std_rows = float(counts_df["count"].std())
+    print("\n--- Conteo Sin Clave (Round-robin) ---")
+    print(sin_clave.to_string(index=False))
+    print(f"Desviacion estandar sin clave: {sin_clave['count'].std():.2f}")
 
-        bench_results.append({
-            "particiones": parts,
-            "repeticiones_s": [round(t, 4) for t in times],
-            "media_s": round(mean_time, 4),
-            "desv_est_s": round(std_time, 4),
-            "min_filas_particion": min_rows,
-            "max_filas_particion": max_rows,
-            "desv_est_filas": round(std_rows, 2)
-        })
-        print(f"Particiones: {parts:3d} | Media: {mean_time:.4f}s (+/- {std_time:.4f}s) | Filas [Min: {min_rows}, Max: {max_rows}, Std: {std_rows:.1f}]")
-
-    os.makedirs("results", exist_ok=True)
-    with open("results/benchmark_balanceo.json", "w", encoding="utf-8") as f:
-        json.dump(bench_results, f, indent=4)
-    print("Experimento completado y guardado en results/benchmark_balanceo.json")
+    print("\n--- Conteo Con Clave (Hash partitioning por Categoria) ---")
+    print(con_clave.to_string(index=False))
+    print(f"Desviacion estandar con clave: {con_clave['count'].std():.2f}")
 
     spark.stop()
 
 if __name__ == "__main__":
-    run_mapreduce_closure()
+    run_analytics_delta()
